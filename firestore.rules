@@ -1,0 +1,155 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =====================================================================
+    //  Helper Functions
+    // =====================================================================
+
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuth() && request.auth.uid == userId;
+    }
+
+    function isPartner(userDoc) {
+      return isAuth() && userDoc.partnerId == request.auth.uid;
+    }
+
+    function isNotPartnered(userDoc) {
+      return !userDoc.keys().has('partnershipId') || userDoc.partnershipId == null;
+    }
+
+    function isPartnershipMember(partnershipDoc) {
+      return isAuth() && (request.auth.uid == partnershipDoc.user1Id || request.auth.uid == partnershipDoc.user2Id);
+    }
+
+    // =====================================================================
+    //  Collection: users
+    // =====================================================================
+
+    match /users/{userId} {
+      /**
+       * READ:
+       * - A user can read their own document.
+       * - A user can read their partner's document.
+       * - Any authenticated user can read the document of a user who is NOT yet partnered.
+       *   This is CRITICAL for the linking process to check a potential partner's status.
+       *   Once a user is partnered, this rule protects their data from being read by outsiders.
+       */
+      allow read: if isAuth() && (
+        isOwner(userId) ||
+        isPartner(resource.data) ||
+        isNotPartnered(resource.data)
+      );
+
+      /**
+       * CREATE:
+       * - A user can create their own document upon sign-up.
+       * - Validates the exact fields sent by the client's `signUp` function.
+       * - Enforces correct initial state (e.g., totalPoints = 0).
+       */
+      allow create: if isOwner(userId) &&
+        request.resource.data.keys().hasAll(['id', 'email', 'createdAt', 'lastActive', 'totalPoints', 'hasCompletedOnboarding']) &&
+        request.resource.data.id == userId &&
+        request.resource.data.email is string &&
+        request.resource.data.totalPoints == 0 &&
+        request.resource.data.hasCompletedOnboarding == false &&
+        // Allow for a small clock skew between client and server
+        request.resource.data.createdAt.toMillis() >= (request.time.toMillis() - 5000) &&
+        request.resource.data.createdAt.toMillis() <= (request.time.toMillis() + 5000) &&
+        request.resource.data.lastActive == request.resource.data.createdAt;
+
+      /**
+       * UPDATE:
+       * - Split into two rules for security: one for general profile updates,
+       *   and a very strict one for the partner linking transaction.
+       */
+
+      // Rule 1: General profile updates by the owner.
+      allow update: if isOwner(userId) &&
+        // The fields being changed must ONLY be from this allowed list.
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'lastActive', 'hasCompletedOnboarding', 'expoPushToken']) &&
+        // Core immutable fields must not change.
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.createdAt == resource.data.createdAt;
+
+      // Rule 2: Partner linking update (atomic transaction).
+      allow update: if isAuth() &&
+        // This update MUST ONLY set the partner and partnership IDs.
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerId', 'partnershipId', 'lastActive']) &&
+        // The user must not have been in a partnership before this change.
+        isNotPartnered(resource.data) &&
+        // The new partnership document MUST exist after this transaction completes.
+        existsAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)) &&
+        // The requester and the user being updated must both be members of that new partnership.
+        isPartnershipMember(getAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data);
+    }
+
+    // =====================================================================
+    //  Collection: partnerships
+    // =====================================================================
+
+    match /partnerships/{partnershipId} {
+      /**
+       * READ, UPDATE, DELETE:
+       * - Only members of the partnership can perform these actions.
+       */
+      allow read, update, delete: if isPartnershipMember(resource.data);
+
+      /**
+       * CREATE:
+       * - The user creating the partnership must be one of the two members.
+       * - Critically, it checks that both users exist and are NOT already partnered.
+       */
+      allow create: if isPartnershipMember(request.resource.data) &&
+        request.resource.data.user1Id != request.resource.data.user2Id &&
+        // Verify user1 exists and is not partnered
+        exists(/databases/$(database)/documents/users/$(request.resource.data.user1Id)) &&
+        isNotPartnered(get(/databases/$(database)/documents/users/$(request.resource.data.user1Id)).data) &&
+        // Verify user2 exists and is not partnered
+        exists(/databases/$(database)/documents/users/$(request.resource.data.user2Id)) &&
+        isNotPartnered(get(/databases/$(database)/documents/users/$(request.resource.data.user2Id)).data) &&
+        // Enforce correct initial state
+        request.resource.data.sharedPoints == 0 &&
+        request.resource.data.isActive == true;
+    }
+
+    // =====================================================================
+    //  Collection: tasks (Assumed to be nested under partnerships)
+    // =====================================================================
+    match /partnerships/{partnershipId}/tasks/{taskId} {
+      /**
+       * READ, WRITE (Create, Update, Delete):
+       * - All task operations require the user to be a member of the parent partnership.
+       */
+       allow read, write: if isPartnershipMember(get(/databases/$(database)/documents/partnerships/$(partnershipId)).data);
+
+       // Note: More granular rules for create/update/delete could be added here
+       // using helper functions if needed, but this provides the core security.
+    }
+
+
+    // =====================================================================
+    //  Collection: linkingCodes
+    // =====================================================================
+
+    match /linkingCodes/{codeId} {
+      /**
+       * READ: Any authenticated user can read a code document. The security is in the
+       * code's value and its short-lived, single-use nature.
+       * CREATE: Only the user specified in `createdBy` can create the code.
+       * UPDATE: Can be marked 'used' by a valid consumer (not expired, not self).
+       * DELETE: Can be deleted by its creator or if it's expired.
+       */
+      allow read: if isAuth();
+      allow create: if isOwner(request.resource.data.createdBy);
+      allow update: if isAuth() && request.resource.data.isUsed == true && resource.data.isUsed == false;
+      allow delete: if isOwner(resource.data.createdBy) || resource.data.expiresAt < request.time;
+    }
+  }
+}

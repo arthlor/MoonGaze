@@ -1,0 +1,270 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions for validation
+    function isValidLinkingCode(data) {
+      return data.keys().hasAll(['createdBy', 'createdAt', 'expiresAt', 'isUsed']) &&
+             data.createdBy is string &&
+             data.createdAt is timestamp &&
+             data.expiresAt is timestamp &&
+             data.isUsed is bool &&
+             data.expiresAt > data.createdAt;
+    }
+    
+    function canUseLinkingCode(userId, codeData) {
+      return !codeData.isUsed && 
+             codeData.expiresAt > request.time &&
+             codeData.createdBy != userId;
+    }
+    
+    function isPartnershipMember(partnershipData, userId) {
+      return partnershipData.user1Id == userId || partnershipData.user2Id == userId;
+    }
+    
+    // Enhanced task validation functions
+    function isValidTaskStatusTransition(currentStatus, newStatus) {
+      // Valid status transitions:
+      // todo -> in_progress
+      // in_progress -> todo, done
+      // done -> in_progress (reopening)
+      return (currentStatus == 'todo' && newStatus == 'in_progress') ||
+             (currentStatus == 'in_progress' && (newStatus == 'todo' || newStatus == 'done')) ||
+             (currentStatus == 'done' && newStatus == 'in_progress');
+    }
+    
+    function isValidTaskAssignmentChange(currentData, newData, userId) {
+      // Allow assignment changes only by:
+      // 1. Task creator
+      // 2. Current assignee (can unassign themselves or reassign)
+      // 3. New assignee (can claim unassigned tasks)
+      return currentData.createdBy == userId ||
+             currentData.assignedTo == userId ||
+             (currentData.assignedTo == null && newData.assignedTo == userId);
+    }
+    
+    function isValidTaskUpdate(currentData, newData, userId) {
+      // Validate that only allowed fields are being updated
+      let allowedFields = ['title', 'description', 'category', 'assignedTo', 'status', 'dueDate', 'updatedAt', 'completedAt'];
+      let updatedFields = newData.diff(currentData).affectedKeys();
+      
+      // Check if all updated fields are allowed
+      return updatedFields.hasOnly(allowedFields) &&
+             // Validate status transitions
+             (newData.status == currentData.status || isValidTaskStatusTransition(currentData.status, newData.status)) &&
+             // Validate assignment changes
+             (newData.assignedTo == currentData.assignedTo || isValidTaskAssignmentChange(currentData, newData, userId)) &&
+             // Prevent modification of core fields
+             newData.createdBy == currentData.createdBy &&
+             newData.partnershipId == currentData.partnershipId &&
+             newData.createdAt == currentData.createdAt &&
+             // Validate data types and constraints
+             (newData.title is string && newData.title.size() > 0 && newData.title.size() <= 100) &&
+             (!newData.keys().hasAny(['description']) || 
+              (newData.description is string && newData.description.size() <= 500)) &&
+             (newData.category in ['Household', 'Errands', 'Financial', 'Planning', 'Wellness', 'Misc']) &&
+             (newData.status in ['todo', 'in_progress', 'done']) &&
+             (!newData.keys().hasAny(['assignedTo']) || 
+              (newData.assignedTo is string && newData.assignedTo.size() > 0)) &&
+             // Validate completedAt is only set when status is 'done'
+             (!newData.keys().hasAny(['completedAt']) || 
+              (newData.status == 'done' && newData.completedAt is timestamp) ||
+              (newData.status != 'done' && newData.completedAt == null));
+    }
+    
+    function isValidTaskDeletion(taskData, userId) {
+      // Only allow deletion by task creator and only if not completed
+      return taskData.createdBy == userId && taskData.status != 'done';
+    }
+
+    // Users can only access their own user document with enhanced validation
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      
+      allow create: if request.auth != null && 
+        request.auth.uid == userId &&
+        request.resource.data.keys().hasAll(['id', 'email', 'createdAt', 'lastActive', 'totalPoints']) &&
+        request.resource.data.id == userId &&
+        request.resource.data.email is string && request.resource.data.email.size() > 0 &&
+        request.resource.data.createdAt is timestamp &&
+        request.resource.data.lastActive is timestamp &&
+        request.resource.data.totalPoints == 0;
+      
+      allow update: if request.auth != null && 
+        (
+          // Self-update path with enhanced validation
+          (
+            request.auth.uid == userId &&
+            resource != null &&
+            // Prevent modification of core fields
+            request.resource.data.id == resource.data.id &&
+            request.resource.data.email == resource.data.email &&
+            request.resource.data.createdAt == resource.data.createdAt &&
+            // Validate points can only increase or stay the same (prevent cheating)
+            request.resource.data.totalPoints >= resource.data.totalPoints &&
+            // Validate data types
+            request.resource.data.totalPoints is int &&
+            request.resource.data.lastActive is timestamp
+          ) ||
+          // Partner linking path: allow updating the partner's user doc in the same transaction
+          (
+            request.auth.uid != userId &&
+            resource != null &&
+            // Only allow setting partnership fields and lastActive
+            request.resource.data.keys().hasOnly(['id','email','displayName','partnerId','partnershipId','createdAt','lastActive','totalPoints','hasCompletedOnboarding','expoPushToken','lastTokenUpdate']) &&
+            // Ensure partnership fields are being added and were not previously set
+            resource.data.partnerId == null && resource.data.partnershipId == null &&
+            request.resource.data.partnerId == request.auth.uid &&
+            // Validate partnership exists in this transaction and contains both users
+            existsAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)) &&
+            isPartnershipMember(getAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data, request.auth.uid) &&
+            isPartnershipMember(getAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data, userId)
+          )
+        );
+    }
+
+    // Enhanced partnerships rules for client-side creation
+    match /partnerships/{partnershipId} {
+      // Allow reading by both partners
+      allow read: if request.auth != null && 
+        resource != null &&
+        isPartnershipMember(resource.data, request.auth.uid);
+      
+      // Allow creation during client-side linking process with enhanced validation
+      allow create: if request.auth != null && 
+        request.resource.data.keys().hasAll(['user1Id', 'user2Id', 'createdAt', 'sharedPoints', 'isActive']) &&
+        (request.resource.data.user1Id == request.auth.uid || 
+         request.resource.data.user2Id == request.auth.uid) &&
+        request.resource.data.user1Id != request.resource.data.user2Id &&
+        request.resource.data.createdAt is timestamp &&
+        // Validate initial values
+        request.resource.data.sharedPoints == 0 &&
+        request.resource.data.isActive == true &&
+        // Validate user IDs are strings
+        request.resource.data.user1Id is string && request.resource.data.user1Id.size() > 0 &&
+        request.resource.data.user2Id is string && request.resource.data.user2Id.size() > 0;
+      
+      // Allow updates by both partners with enhanced validation
+      allow update: if request.auth != null && 
+        resource != null &&
+        isPartnershipMember(resource.data, request.auth.uid) &&
+        isPartnershipMember(request.resource.data, request.auth.uid) &&
+        // Prevent modification of core partnership fields
+        request.resource.data.user1Id == resource.data.user1Id &&
+        request.resource.data.user2Id == resource.data.user2Id &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        // Validate that no unexpected fields are added
+        request.resource.data.keys().hasOnly(['user1Id', 'user2Id', 'createdAt', 'sharedPoints', 'isActive']) &&
+        request.resource.data.sharedPoints is int && request.resource.data.sharedPoints >= 0 &&
+        request.resource.data.isActive is bool;
+      
+      // Allow deletion by both partners
+      allow delete: if request.auth != null && 
+        resource != null &&
+        isPartnershipMember(resource.data, request.auth.uid);
+    }
+
+    // Enhanced tasks rules with partnership validation
+    match /tasks/{taskId} {
+      // Allow reading by partnership members
+      allow read: if request.auth != null && 
+        resource != null &&
+        exists(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)) &&
+        isPartnershipMember(
+          get(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)).data, 
+          request.auth.uid
+        );
+      
+      // Allow creation by partnership members with enhanced validation
+      allow create: if request.auth != null && 
+        request.resource.data.keys().hasAll(['partnershipId', 'createdBy', 'title', 'category', 'status', 'createdAt', 'updatedAt']) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        // Validate initial status is 'todo'
+        request.resource.data.status == 'todo' &&
+        // Validate required string fields are not empty
+        request.resource.data.title is string && request.resource.data.title.size() > 0 &&
+        request.resource.data.category is string && request.resource.data.category.size() > 0 &&
+        // Validate category is one of allowed values
+        request.resource.data.category in ['Household', 'Errands', 'Financial', 'Planning', 'Wellness', 'Misc'] &&
+        // Validate timestamps
+        request.resource.data.createdAt is timestamp &&
+        request.resource.data.updatedAt is timestamp &&
+        // Validate optional assignedTo field
+        (!request.resource.data.keys().hasAny(['assignedTo']) || 
+         (request.resource.data.assignedTo is string && request.resource.data.assignedTo.size() > 0)) &&
+        // Validate partnership membership
+        exists(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)) &&
+        isPartnershipMember(
+          get(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data, 
+          request.auth.uid
+        );
+      
+      // Allow updates by partnership members with enhanced validation
+      allow update: if request.auth != null && 
+        resource != null &&
+        exists(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)) &&
+        isPartnershipMember(
+          get(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)).data, 
+          request.auth.uid
+        ) &&
+        // Enhanced validation for task updates
+        isValidTaskUpdate(resource.data, request.resource.data, request.auth.uid);
+      
+      // Allow deletion by task creator with enhanced validation
+      allow delete: if request.auth != null && 
+        resource != null &&
+        exists(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)) &&
+        isPartnershipMember(
+          get(/databases/$(database)/documents/partnerships/$(resource.data.partnershipId)).data, 
+          request.auth.uid
+        ) &&
+        // Enhanced validation for task deletion
+        isValidTaskDeletion(resource.data, request.auth.uid);
+    }
+
+    // Enhanced linking codes rules for client-side operations
+    match /linkingCodes/{codeId} {
+      allow read: if request.auth != null;
+      
+      // Allow creation only by authenticated users for themselves with valid data
+      allow create: if request.auth != null && 
+        request.auth.uid == request.resource.data.createdBy &&
+        isValidLinkingCode(request.resource.data);
+      
+      // Allow updates by code creator (for marking as used) or by users who can use the code
+      allow update: if request.auth != null && 
+        (resource.data.createdBy == request.auth.uid || 
+         canUseLinkingCode(request.auth.uid, resource.data));
+      
+      // Allow deletion by code creator or cleanup of expired codes by any authenticated user
+      allow delete: if request.auth != null && 
+        (resource.data.createdBy == request.auth.uid || 
+         resource.data.expiresAt < request.time);
+    }
+
+    // Allow partner linking updates within the same transaction as partnership creation
+    match /users/{userId} {
+      allow update: if request.auth != null &&
+        request.auth.uid != userId &&
+        resource != null &&
+        // Only partnerId, partnershipId, and lastActive may change
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerId','partnershipId','lastActive']) &&
+        // Previous state had no partnership
+        (resource.data.partnerId == null || resource.data.partnerId == '') &&
+        (resource.data.partnershipId == null || resource.data.partnershipId == '') &&
+        // New state must link to requester
+        request.resource.data.partnerId == request.auth.uid &&
+        request.resource.data.partnershipId is string && request.resource.data.partnershipId.size() > 0 &&
+        request.resource.data.lastActive is timestamp &&
+        // Partnership document must be created/updated in this same commit, containing both users
+        existsAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)) &&
+        isPartnershipMember(getAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data, request.auth.uid) &&
+        isPartnershipMember(getAfter(/databases/$(database)/documents/partnerships/$(request.resource.data.partnershipId)).data, userId);
+    }
+
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
